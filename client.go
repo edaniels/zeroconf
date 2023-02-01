@@ -4,17 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff"
 	"github.com/miekg/dns"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 // IPType specifies the IP traffic the client listens for.
@@ -93,6 +89,7 @@ func NewResolver(options ...ClientOption) (*Resolver, error) {
 	var shutdownEnd sync.WaitGroup
 	c, err := newClient(shutdownCtx, &shutdownEnd, conf)
 	if err != nil {
+		shutdownCtxCancel()
 		return nil, err
 	}
 	return &Resolver{
@@ -185,8 +182,8 @@ func defaultParams(instance, service, domain string) *lookupParams {
 type client struct {
 	shutdownCtx context.Context
 	shutdownEnd *sync.WaitGroup
-	ipv4conn    *ipv4.PacketConn
-	ipv6conn    *ipv6.PacketConn
+	ipv4Conns   []ifcConn4Pair
+	ipv6Conns   []ifcConn6Pair
 	ifaces      []net.Interface
 	acceptOnly  IPType
 }
@@ -202,30 +199,45 @@ func newClient(
 		ifaces = listMulticastInterfaces()
 	}
 	// IPv4 interfaces
-	var ipv4conn *ipv4.PacketConn
+	ipv4Conns := make([]ifcConn4Pair, 0, len(ifaces))
 	if (opts.listenOn & IPv4) > 0 {
-		var err error
-		ipv4conn, err = joinUdp4Multicast(ifaces)
-		if err != nil {
-			return nil, err
+		for _, iface := range ifaces {
+			ifaceCopy := iface
+			ipv4conn, err4 := joinUdp4Multicast([]net.Interface{ifaceCopy})
+			if err4 == nil {
+				ipv4Conns = append(ipv4Conns, ifcConn4Pair{ipv4conn, &ifaceCopy})
+				continue
+			}
+			var errJoin *multicastJoinError
+			if !errors.As(err4, &errJoin) {
+				return nil, err4
+			}
 		}
 	}
 	// IPv6 interfaces
-	var ipv6conn *ipv6.PacketConn
+	ipv6Conns := make([]ifcConn6Pair, 0, len(ifaces))
 	if (opts.listenOn & IPv6) > 0 {
-		var err error
-		ipv6conn, err = joinUdp6Multicast(ifaces)
-		if err != nil {
-			return nil, err
+		for _, iface := range ifaces {
+			ifaceCopy := iface
+			ipv6conn, err6 := joinUdp6Multicast([]net.Interface{ifaceCopy})
+			if err6 == nil {
+				ipv6Conns = append(ipv6Conns, ifcConn6Pair{ipv6conn, &ifaceCopy})
+				continue
+			}
+			var errJoin *multicastJoinError
+			if !errors.As(err6, &errJoin) {
+				return nil, err6
+			}
 		}
 	}
+
+	fmt.Println("CONNS...", len(ipv4Conns), len(ipv6Conns))
 
 	return &client{
 		shutdownCtx: shutdownCtx,
 		shutdownEnd: shutdownEnd,
-		ipv4conn:    ipv4conn,
-		ipv6conn:    ipv6conn,
-		ifaces:      ifaces,
+		ipv4Conns:   ipv4Conns,
+		ipv6Conns:   ipv6Conns,
 		acceptOnly:  opts.acceptOnly,
 	}, nil
 }
@@ -234,13 +246,15 @@ func newClient(
 func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 	// start listening for responses
 	msgCh := make(chan *dns.Msg, 32)
-	if c.ipv4conn != nil {
+	for _, conn := range c.ipv4Conns {
 		c.shutdownEnd.Add(1)
-		managedGo(func() { c.recv(ctx, c.ipv4conn, msgCh) }, c.shutdownEnd.Done)
+		connCopy := conn
+		managedGo(func() { c.recv(ctx, connCopy, msgCh) }, c.shutdownEnd.Done)
 	}
-	if c.ipv6conn != nil {
+	for _, conn := range c.ipv6Conns {
 		c.shutdownEnd.Add(1)
-		managedGo(func() { c.recv(ctx, c.ipv6conn, msgCh) }, c.shutdownEnd.Done)
+		connCopy := conn
+		managedGo(func() { c.recv(ctx, connCopy, msgCh) }, c.shutdownEnd.Done)
 	}
 
 	c.shutdownEnd.Add(1)
@@ -369,35 +383,17 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 
 // Shutdown client will close currently open connections and channel implicitly.
 func (c *client) shutdown() {
-	if c.ipv4conn != nil {
-		c.ipv4conn.Close()
+	for _, conn := range c.ipv4Conns {
+		conn.Close()
 	}
-	if c.ipv6conn != nil {
-		c.ipv6conn.Close()
+	for _, conn := range c.ipv6Conns {
+		conn.Close()
 	}
 }
 
 // Data receiving routine reads from connection, unpacks packets into dns.Msg
 // structures and sends them to a given msgCh channel
-func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
-	var readFrom func([]byte) (n int, src net.Addr, err error)
-
-	switch pConn := l.(type) {
-	case *ipv6.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
-		}
-	case *ipv4.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
-		}
-
-	default:
-		return
-	}
-
+func (c *client) recv(ctx context.Context, conn net.PacketConn, msgCh chan *dns.Msg) {
 	buf := make([]byte, 65536)
 	var fatalErr error
 	for {
@@ -409,7 +405,9 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 			return
 		}
 
-		n, _, err := readFrom(buf)
+		println("READING!")
+		n, _, err := conn.ReadFrom(buf)
+		println("READ@@@")
 		if err != nil {
 			fatalErr = err
 			continue
@@ -421,6 +419,7 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 		}
 		select {
 		case msgCh <- msg:
+			fmt.Println("GOT MSG", msg)
 			// Submit decoded DNS message and continue.
 		case <-ctx.Done():
 			// Abort.
@@ -512,41 +511,14 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 	if err != nil {
 		return err
 	}
-	if c.ipv4conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv4.ControlMessage
-		for ifi := range c.ifaces {
-			wcm.IfIndex = c.ifaces[ifi].Index
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = c.ifaces[ifi].Index
-			default:
-				if err := c.ipv4conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			c.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
-		}
+	fmt.Println("send query for", msg, len(c.ipv4Conns), len(c.ipv6Conns))
+	for _, conn := range c.ipv4Conns {
+		fmt.Println("send query1...")
+		conn.WriteTo(buf, conn.MulticastDstAddr())
 	}
-	if c.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
-		for ifi := range c.ifaces {
-			wcm.IfIndex = c.ifaces[ifi].Index
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = c.ifaces[ifi].Index
-			default:
-				if err := c.ipv6conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			c.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
-		}
+	for _, conn := range c.ipv6Conns {
+		fmt.Println("send query2...")
+		conn.WriteTo(buf, conn.MulticastDstAddr())
 	}
 	return nil
 }

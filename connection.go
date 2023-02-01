@@ -59,10 +59,19 @@ func joinUdp6Multicast(interfaces []net.Interface) (*ipv6.PacketConn, error) {
 	}
 	if failedJoins == len(interfaces) {
 		pkConn.Close()
-		return nil, fmt.Errorf("udp6: failed to join any of these interfaces: %v", interfaces)
+		return nil, &multicastJoinError{"udp6", interfaces}
 	}
 
 	return pkConn, nil
+}
+
+type multicastJoinError struct {
+	network    string
+	interfaces []net.Interface
+}
+
+func (m *multicastJoinError) Error() string {
+	return fmt.Sprintf("%s: failed to join any of these interfaces: %v", m.network, m.interfaces)
 }
 
 func joinUdp4Multicast(interfaces []net.Interface) (*ipv4.PacketConn, error) {
@@ -90,7 +99,7 @@ func joinUdp4Multicast(interfaces []net.Interface) (*ipv4.PacketConn, error) {
 	}
 	if failedJoins == len(interfaces) {
 		pkConn.Close()
-		return nil, fmt.Errorf("udp4: failed to join any of these interfaces: %v", interfaces)
+		return nil, &multicastJoinError{"udp4", interfaces}
 	}
 
 	return pkConn, nil

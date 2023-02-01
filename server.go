@@ -4,16 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/edaniels/golog"
 	"github.com/miekg/dns"
+	"go.uber.org/multierr"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -154,10 +154,9 @@ const (
 
 // Server structure encapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	service  *ServiceEntry
-	ipv4conn *ipv4.PacketConn
-	ipv6conn *ipv6.PacketConn
-	ifaces   []net.Interface
+	service   *ServiceEntry
+	ipv4Conns []ifcConn4Pair
+	ipv6Conns []ifcConn6Pair
 
 	shutdownCtx       context.Context
 	shutdownCtxCancel func()
@@ -168,56 +167,136 @@ type Server struct {
 	startupWait       sync.WaitGroup
 }
 
+type ifcConn4Pair struct {
+	*ipv4.PacketConn
+	ifc *net.Interface
+}
+
+func (p4 ifcConn4Pair) NetInterface() *net.Interface {
+	return p4.ifc
+}
+
+func (p4 ifcConn4Pair) MulticastDstAddr() *net.UDPAddr {
+	return ipv4Addr
+}
+
+func (p4 ifcConn4Pair) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, _, addr, err = p4.PacketConn.ReadFrom(p)
+	return n, addr, err
+}
+
+func (p4 ifcConn4Pair) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	return p4.PacketConn.WriteTo(p, nil, addr)
+}
+
+type ifcConn6Pair struct {
+	*ipv6.PacketConn
+	ifc *net.Interface
+}
+
+func (p6 ifcConn6Pair) NetInterface() *net.Interface {
+	return p6.ifc
+}
+
+func (p6 ifcConn6Pair) MulticastDstAddr() *net.UDPAddr {
+	return ipv6Addr
+}
+
+func (p6 ifcConn6Pair) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, _, addr, err = p6.PacketConn.ReadFrom(p)
+	return n, addr, err
+}
+
+func (p6 ifcConn6Pair) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	return p6.PacketConn.WriteTo(p, nil, addr)
+}
+
+type netInterfacePacketConnPairing interface {
+	NetInterface() *net.Interface
+	net.PacketConn
+	MulticastDstAddr() *net.UDPAddr
+}
+
 // Constructs server structure
 func newServer(ifaces []net.Interface) (*Server, error) {
-	ipv4conn, err4 := joinUdp4Multicast(ifaces)
-	if err4 != nil {
-		log.Printf("[zeroconf] no suitable IPv4 interface: %s", err4.Error())
+	if len(ifaces) == 0 {
+		return nil, errors.New("must provide at least one interface")
 	}
-	ipv6conn, err6 := joinUdp6Multicast(ifaces)
-	if err6 != nil {
-		log.Printf("[zeroconf] no suitable IPv6 interface: %s", err6.Error())
+	srv := &Server{
+		ttl: 3200,
 	}
-	if err4 != nil && err6 != nil {
+	ipv4Conns := make([]ifcConn4Pair, 0, len(ifaces))
+	for idx, iface := range ifaces {
+		ifaceCopy := iface
+		ipv4conn, err4 := joinUdp4Multicast([]net.Interface{ifaceCopy})
+		if err4 == nil {
+			ipv4Conns = append(ipv4Conns, ifcConn4Pair{ipv4conn, &ifaceCopy})
+			continue
+		}
+		var errJoin *multicastJoinError
+		if !errors.As(err4, &errJoin) {
+			golog.Global().Errorw("[zeroconf] failed to join interface to multicast", "idx", idx, "error", err4)
+		}
+	}
+	if len(ipv4Conns) == 0 {
+		golog.Global().Errorw("[zeroconf] no suitable IPv4 interface")
+	}
+
+	ipv6Conns := make([]ifcConn6Pair, 0, len(ifaces))
+	for idx, iface := range ifaces {
+		ifaceCopy := iface
+		ipv6conn, err6 := joinUdp6Multicast([]net.Interface{ifaceCopy})
+		if err6 == nil {
+			ipv6Conns = append(ipv6Conns, ifcConn6Pair{ipv6conn, &ifaceCopy})
+			continue
+		}
+		var errJoin *multicastJoinError
+		if !errors.As(err6, &errJoin) {
+			golog.Global().Errorw("[zeroconf] failed to join interface to multicast", "idx", idx, "error", err6)
+		}
+	}
+	if len(ipv6Conns) == 0 {
+		golog.Global().Errorw("[zeroconf] no suitable IPv4 interface")
+	}
+	if len(ipv4Conns) == 0 && len(ipv6Conns) == 0 {
 		// No supported interface left.
 		return nil, errors.New("no supported interface")
 	}
 
 	shutdownCtx, shutdownCtxCancel := context.WithCancel(context.Background())
-	s := &Server{
-		ipv4conn:          ipv4conn,
-		ipv6conn:          ipv6conn,
-		ifaces:            ifaces,
-		ttl:               3200,
-		shutdownCtx:       shutdownCtx,
-		shutdownCtxCancel: shutdownCtxCancel,
-	}
+	srv.ipv4Conns = ipv4Conns
+	srv.ipv6Conns = ipv6Conns
+	srv.shutdownCtx = shutdownCtx
+	srv.shutdownCtxCancel = shutdownCtxCancel
 
-	return s, nil
+	return srv, nil
 }
 
 // startReceivers starts both IPv4/6 receiver loops and and waits for the shutdown signal from exit channel
 func (s *Server) startReceivers() {
-	if s.ipv4conn != nil {
+	fmt.Println("STARTING RECV")
+	for _, conn := range s.ipv4Conns {
 		s.startupWait.Add(1)
 		s.shutdownEnd.Add(1)
 		var nextInstance bool
+		connCopy := conn
 		managedGo(func() {
 			defer func() {
 				nextInstance = true
 			}()
-			s.recv4(s.ipv4conn, !nextInstance)
+			s.recv4(connCopy, !nextInstance)
 		}, s.shutdownEnd.Done)
 	}
-	if s.ipv6conn != nil {
+	for _, conn := range s.ipv6Conns {
 		s.shutdownEnd.Add(1)
 		s.startupWait.Add(1)
 		var nextInstance bool
+		connCopy := conn
 		managedGo(func() {
 			defer func() {
 				nextInstance = true
 			}()
-			s.recv6(s.ipv6conn, !nextInstance)
+			s.recv6(connCopy, !nextInstance)
 		}, s.shutdownEnd.Done)
 	}
 }
@@ -250,11 +329,11 @@ func (s *Server) shutdown() error {
 
 	s.shutdownCtxCancel()
 
-	if s.ipv4conn != nil {
-		s.ipv4conn.Close()
+	for _, conn := range s.ipv4Conns {
+		conn.Close()
 	}
-	if s.ipv6conn != nil {
-		s.ipv6conn.Close()
+	for _, conn := range s.ipv6Conns {
+		conn.Close()
 	}
 
 	// Wait for connection and routines to be closed
@@ -265,10 +344,7 @@ func (s *Server) shutdown() error {
 }
 
 // recv is a long running routine to receive packets from an interface
-func (s *Server) recv4(c *ipv4.PacketConn, firstInstance bool) {
-	if c == nil {
-		return
-	}
+func (s *Server) recv4(ifcConnPair ifcConn4Pair, firstInstance bool) {
 	firstRecv := firstInstance
 	buf := make([]byte, 65536)
 	for {
@@ -280,24 +356,17 @@ func (s *Server) recv4(c *ipv4.PacketConn, firstInstance bool) {
 				s.startupWait.Done()
 				firstRecv = false
 			}
-			var ifIndex int
-			n, cm, from, err := c.ReadFrom(buf)
+			n, from, err := ifcConnPair.ReadFrom(buf)
 			if err != nil {
 				continue
 			}
-			if cm != nil {
-				ifIndex = cm.IfIndex
-			}
-			_ = s.parsePacket(buf[:n], ifIndex, from)
+			_ = s.parsePacket(buf[:n], ifcConnPair, from)
 		}
 	}
 }
 
 // recv is a long running routine to receive packets from an interface
-func (s *Server) recv6(c *ipv6.PacketConn, firstInstance bool) {
-	if c == nil {
-		return
-	}
+func (s *Server) recv6(ifcConnPair ifcConn6Pair, firstInstance bool) {
 	firstRecv := firstInstance
 	buf := make([]byte, 65536)
 	for {
@@ -309,31 +378,27 @@ func (s *Server) recv6(c *ipv6.PacketConn, firstInstance bool) {
 				s.startupWait.Done()
 				firstRecv = false
 			}
-			var ifIndex int
-			n, cm, from, err := c.ReadFrom(buf)
+			n, from, err := ifcConnPair.ReadFrom(buf)
 			if err != nil {
 				continue
 			}
-			if cm != nil {
-				ifIndex = cm.IfIndex
-			}
-			_ = s.parsePacket(buf[:n], ifIndex, from)
+			_ = s.parsePacket(buf[:n], ifcConnPair, from)
 		}
 	}
 }
 
 // parsePacket is used to parse an incoming packet
-func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
+func (s *Server) parsePacket(packet []byte, ifcConnPair netInterfacePacketConnPairing, from net.Addr) error {
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
 		// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
 		return err
 	}
-	return s.handleQuery(&msg, ifIndex, from)
+	return s.handleQuery(&msg, ifcConnPair, from)
 }
 
 // handleQuery is used to handle an incoming query
-func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
+func (s *Server) handleQuery(query *dns.Msg, ifcConnPair netInterfacePacketConnPairing, from net.Addr) error {
 	// Ignore questions with authoritative section for now
 	if len(query.Ns) > 0 {
 		return nil
@@ -350,7 +415,8 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 		resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
 		resp.Answer = []dns.RR{}
 		resp.Extra = []dns.RR{}
-		if err = s.handleQuestion(q, &resp, query, ifIndex); err != nil {
+		fmt.Println("GOT A QUESTION")
+		if err = s.handleQuestion(q, &resp, query, ifcConnPair.NetInterface()); err != nil {
 			// log.Printf("[ERR] zeroconf: failed to handle question %v: %v", q, err)
 			continue
 		}
@@ -361,12 +427,12 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 
 		if isUnicastQuestion(q) {
 			// Send unicast
-			if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
+			if e := s.unicastResponse(&resp, ifcConnPair, from); e != nil {
 				err = e
 			}
 		} else {
 			// Send mulicast
-			if e := s.multicastResponse(&resp, ifIndex); e != nil {
+			if e := s.multicastResponse(&resp, ifcConnPair); e != nil {
 				err = e
 			}
 		}
@@ -402,11 +468,12 @@ func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
 }
 
 // handleQuestion is used to handle an incoming question
-func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, ifIndex int) error {
+func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, ifc *net.Interface) error {
 	if s.service == nil {
 		return nil
 	}
 
+	fmt.Println("QUERY FOR NAME")
 	switch q.Name {
 	case s.service.ServiceTypeName():
 		s.serviceTypeName(resp, s.ttl)
@@ -415,19 +482,19 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 		}
 
 	case s.service.ServiceName():
-		s.composeBrowsingAnswers(resp, ifIndex)
+		s.composeBrowsingAnswers(resp, ifc)
 		if isKnownAnswer(resp, query) {
 			resp.Answer = nil
 		}
 
 	case s.service.ServiceInstanceName():
-		s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
+		s.composeLookupAnswers(resp, s.ttl, ifc, false)
 	default:
 		// handle matching subtype query
 		for _, subtype := range s.service.Subtypes {
 			subtype = fmt.Sprintf("%s._sub.%s", subtype, s.service.ServiceName())
 			if q.Name == subtype {
-				s.composeBrowsingAnswers(resp, ifIndex)
+				s.composeBrowsingAnswers(resp, ifc)
 				if isKnownAnswer(resp, query) {
 					resp.Answer = nil
 				}
@@ -439,7 +506,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 	return nil
 }
 
-func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
+func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifc *net.Interface) {
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
 			Name:   s.service.ServiceName(),
@@ -474,10 +541,10 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 	}
 	resp.Extra = append(resp.Extra, srv, txt)
 
-	resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, false)
+	resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifc, false)
 }
 
-func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
+func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifc *net.Interface, flushCache bool) {
 	// From RFC6762
 	//    The most significant bit of the rrclass for a record in the Answer
 	//    Section of a response message is the Multicast DNS cache-flush bit
@@ -537,7 +604,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 			})
 	}
 
-	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
+	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifc, flushCache)
 }
 
 func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
@@ -594,8 +661,15 @@ func (s *Server) probe() {
 	randomizer := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for i := 0; i < multicastRepetitions; i++ {
-		if err := s.multicastResponse(q, 0); err != nil {
-			log.Println("[ERR] zeroconf: failed to send probe:", err.Error())
+		for idx, ifcConnPair := range s.ipv4Conns {
+			if err := s.multicastResponse(q, ifcConnPair); err != nil {
+				golog.Global().Errorw("[zeroconf] failed to send probe on ipv4", "idx", idx, "error", err)
+			}
+		}
+		for idx, ifcConnPair := range s.ipv6Conns {
+			if err := s.multicastResponse(q, ifcConnPair); err != nil {
+				golog.Global().Errorw("[zeroconf] failed to send probe on ipv6", "idx", idx, "error", err)
+			}
 		}
 		if i == 0 {
 			s.startupWait.Done()
@@ -613,17 +687,23 @@ func (s *Server) probe() {
 	//    at least a factor of two with every response sent.
 	timeout := 1 * time.Second
 	for i := 0; i < multicastRepetitions; i++ {
-		for _, intf := range s.ifaces {
+		sendResponse := func(ifcConnPair netInterfacePacketConnPairing) {
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
 			// TODO: make response authoritative if we are the publisher
 			resp.Compress = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
-			s.composeLookupAnswers(resp, s.ttl, intf.Index, true)
-			if err := s.multicastResponse(resp, intf.Index); err != nil {
-				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
+			s.composeLookupAnswers(resp, s.ttl, ifcConnPair.NetInterface(), true)
+			if err := s.multicastResponse(resp, ifcConnPair); err != nil {
+				golog.Global().Errorw("[zeroconf] failed to send announcement", "error", err.Error())
 			}
+		}
+		for _, ifcConnPair := range s.ipv4Conns {
+			sendResponse(ifcConnPair)
+		}
+		for _, ifcConnPair := range s.ipv6Conns {
+			sendResponse(ifcConnPair)
 		}
 		if !selectContextOrWait(s.shutdownCtx, timeout) {
 			return
@@ -648,7 +728,12 @@ func (s *Server) announceText() {
 	}
 
 	resp.Answer = []dns.RR{txt}
-	s.multicastResponse(resp, 0)
+	for _, ifcConnPair := range s.ipv4Conns {
+		s.multicastResponse(resp, ifcConnPair)
+	}
+	for _, ifcConnPair := range s.ipv6Conns {
+		s.multicastResponse(resp, ifcConnPair)
+	}
 }
 
 func (s *Server) unregister() error {
@@ -656,20 +741,24 @@ func (s *Server) unregister() error {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0, 0, true)
-	return s.multicastResponse(resp, 0)
+	s.composeLookupAnswers(resp, 0, nil, true)
+	var errs error
+	for _, conn := range s.ipv4Conns {
+		errs = multierr.Combine(errs, s.multicastResponse(resp, conn))
+	}
+	for _, conn := range s.ipv6Conns {
+		errs = multierr.Combine(errs, s.multicastResponse(resp, conn))
+	}
+	return errs
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
+func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifc *net.Interface, flushCache bool) []dns.RR {
 	v4 := s.service.AddrIPv4
 	v6 := s.service.AddrIPv6
-	if len(v4) == 0 && len(v6) == 0 {
-		iface, _ := net.InterfaceByIndex(ifIndex)
-		if iface != nil {
-			a4, a6 := addrsForInterface(iface)
-			v4 = append(v4, a4...)
-			v6 = append(v6, a6...)
-		}
+	if len(v4) == 0 && len(v6) == 0 && ifc != nil {
+		a4, a6 := addrsForInterface(ifc)
+		v4 = append(v4, a4...)
+		v6 = append(v6, a6...)
 	}
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
@@ -732,104 +821,23 @@ func addrsForInterface(iface *net.Interface) ([]net.IP, []net.IP) {
 }
 
 // unicastResponse is used to send a unicast response packet
-func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) error {
+func (s *Server) unicastResponse(resp *dns.Msg, ifcConnPair netInterfacePacketConnPairing, from net.Addr) error {
 	buf, err := resp.Pack()
 	if err != nil {
 		return err
 	}
 	addr := from.(*net.UDPAddr)
-	if addr.IP.To4() != nil {
-		if ifIndex != 0 {
-			var wcm ipv4.ControlMessage
-			wcm.IfIndex = ifIndex
-			_, err = s.ipv4conn.WriteTo(buf, &wcm, addr)
-		} else {
-			_, err = s.ipv4conn.WriteTo(buf, nil, addr)
-		}
-		return err
-	} else {
-		if ifIndex != 0 {
-			var wcm ipv6.ControlMessage
-			wcm.IfIndex = ifIndex
-			_, err = s.ipv6conn.WriteTo(buf, &wcm, addr)
-		} else {
-			_, err = s.ipv6conn.WriteTo(buf, nil, addr)
-		}
-		return err
-	}
+	_, err = ifcConnPair.WriteTo(buf, addr)
+	return err
 }
 
 // multicastResponse us used to send a multicast response packet
-func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
+func (s *Server) multicastResponse(msg *dns.Msg, ifcConnPair netInterfacePacketConnPairing) error {
 	buf, err := msg.Pack()
 	if err != nil {
 		return err
 	}
-	if s.ipv4conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv4.ControlMessage
-		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
-		} else {
-			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-					}
-				}
-				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
-			}
-		}
-	}
-
-	if s.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
-		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
-		} else {
-			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-					}
-				}
-				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
-			}
-		}
-	}
+	ifcConnPair.WriteTo(buf, ifcConnPair.MulticastDstAddr())
 	return nil
 }
 
