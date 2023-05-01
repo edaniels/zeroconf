@@ -379,22 +379,26 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 		resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
 		resp.Answer = []dns.RR{}
 		resp.Extra = []dns.RR{}
+		println("from...", from.String())
 		if err = s.handleQuestion(q, &resp, query, ifIndex); err != nil {
 			// log.Printf("[ERR] zeroconf: failed to handle question %v: %v", q, err)
 			continue
 		}
 		// Check if there is an answer
 		if len(resp.Answer) == 0 {
+			println("no resp")
 			continue
 		}
 
 		if isUnicastQuestion(q) {
 			// Send unicast
+			println("uni resp")
 			if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
 				err = e
 			}
 		} else {
 			// Send mulicast
+			println("multi resp")
 			if e := s.multicastResponse(&resp, ifIndex); e != nil {
 				err = e
 			}
@@ -434,6 +438,20 @@ func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
 func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, ifIndex int) error {
 	if s.service == nil {
 		return nil
+	}
+
+	if strings.Contains(q.Name, "_rpc") {
+		fmt.Printf(
+			"HANDLING Q %#v %v %v a=%v,b=%v,c=%v\n",
+			q.Name,
+			q.Qclass,
+			q.Qtype,
+			q.Name == s.service.ServiceTypeName(),
+			q.Name == s.service.ServiceName(),
+			q.Name == s.service.ServiceInstanceName(),
+		)
+		// ptr 12
+		// txt/srv 16/33
 	}
 
 	switch q.Name {
@@ -700,6 +718,11 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 			v6 = append(v6, a6...)
 		}
 	}
+	if iface, _ := net.InterfaceByIndex(ifIndex); iface != nil {
+		if (iface.Flags & net.FlagLoopback) > 0 {
+			v4 = append(v4, net.IPv4(127, 0, 0, 1))
+		}
+	}
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
 		// use TTL of 120s, to account for network interface
@@ -800,6 +823,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
 		var wcm ipv4.ControlMessage
 		if ifIndex != 0 {
+			println("Case1")
 			wcm.IfIndex = ifIndex
 			switch runtime.GOOS {
 			case "darwin", "ios", "linux":
@@ -810,9 +834,11 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 				}
 			}
+			println("write to1", ifIndex)
 			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 		} else {
-			for _, intf := range s.ifaces {
+			println("Case2")
+			for ifidx, intf := range s.ifaces {
 				wcm.IfIndex = intf.Index
 				switch runtime.GOOS {
 				case "darwin", "ios", "linux":
@@ -822,6 +848,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 						s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 					}
 				}
+				println("write to2", ifidx)
 				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 			}
 		}

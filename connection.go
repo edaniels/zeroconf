@@ -2,6 +2,7 @@ package zeroconf
 
 import (
 	"fmt"
+	"log"
 	"net"
 
 	"golang.org/x/net/ipv4"
@@ -79,12 +80,12 @@ func joinUdp4Multicast(interfaces []net.Interface) (*ipv4.PacketConn, error) {
 	if len(interfaces) == 0 {
 		interfaces = listMulticastInterfaces()
 	}
-	// log.Println("Using multicast interfaces: ", interfaces)
+	log.Println("Using multicast interfaces: ", interfaces)
 
 	var failedJoins int
 	for _, iface := range interfaces {
 		if err := pkConn.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-			// log.Println("Udp4 JoinGroup failed for iface ", iface)
+			log.Println("Udp4 JoinGroup failed for iface ", iface)
 			failedJoins++
 		}
 	}
@@ -104,9 +105,11 @@ func listMulticastInterfaces() []net.Interface {
 	}
 	for _, ifi := range ifaces {
 		if (ifi.Flags & net.FlagUp) == 0 {
+			fmt.Println("NO", ifi)
 			continue
 		}
 		if (ifi.Flags & net.FlagMulticast) > 0 {
+			fmt.Println("YES", ifi)
 			interfaces = append(interfaces, ifi)
 		}
 	}

@@ -285,10 +285,13 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 						entries[rr.Ptr].TTL = rr.Hdr.Ttl
 					case *dns.SRV:
 						if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Hdr.Name {
+							fmt.Println("no")
 							continue
 						} else if !strings.HasSuffix(rr.Hdr.Name, params.ServiceName()) {
+							fmt.Println("no1")
 							continue
 						}
+						fmt.Println("maybe")
 						if _, ok := entries[rr.Hdr.Name]; !ok {
 							entries[rr.Hdr.Name] = NewServiceEntry(
 								trimDot(strings.Replace(rr.Hdr.Name, params.ServiceName(), "", 1)),
@@ -354,6 +357,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 						// Require at least one resolved IP address for ServiceEntry
 						// TODO: wait some more time as chances are high both will arrive.
 						if len(e.AddrIPv4) == 0 && len(e.AddrIPv6) == 0 {
+							println("skipping...", params.ServiceRecord.ServiceTypeName(), params.ServiceRecord.ServiceName())
 							continue
 						}
 					}
@@ -413,16 +417,18 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 			return
 		}
 
-		n, _, err := readFrom(buf)
+		n, src, err := readFrom(buf)
 		if err != nil {
 			fatalErr = err
 			continue
 		}
+		fmt.Println("somethign form", src)
 		msg := new(dns.Msg)
 		if err := msg.Unpack(buf[:n]); err != nil {
 			// log.Printf("[WARN] mdns: Failed to unpack packet: %v", err)
 			continue
 		}
+		fmt.Println("MSG IS", msg)
 		select {
 		case msgCh <- msg:
 			// Submit decoded DNS message and continue.
@@ -491,7 +497,7 @@ func (c *client) query(params *lookupParams) error {
 
 	// send the query
 	m := new(dns.Msg)
-	if params.Instance != "" { // service instance name lookup
+	if params.Instance == "" { // service instance name lookup
 		serviceInstanceName = fmt.Sprintf("%s.%s", params.Instance, serviceName)
 		m.Question = []dns.Question{
 			{Name: serviceInstanceName, Qtype: dns.TypeSRV, Qclass: dns.ClassINET},
