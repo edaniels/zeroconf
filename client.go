@@ -12,6 +12,7 @@ import (
 	"github.com/cenkalti/backoff"
 	"github.com/edaniels/golog"
 	"github.com/miekg/dns"
+	"go.uber.org/multierr"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -210,22 +211,25 @@ func newClient(
 	// IPv4 interfaces
 	var ipv4conn *ipv4.PacketConn
 	var ipv4Ifaces []net.Interface
+	var ipv4Err, ipv6Err error
 	if (opts.listenOn & IPv4) > 0 {
-		var err error
-		ipv4conn, ipv4Ifaces, err = joinUdp4Multicast(ifaces)
-		if err != nil {
-			return nil, err
+		ipv4conn, ipv4Ifaces, ipv4Err = joinUdp4Multicast(ifaces)
+		if opts.listenOn == IPv4 && ipv4Err != nil {
+			return nil, ipv4Err
 		}
 	}
 	// IPv6 interfaces
 	var ipv6conn *ipv6.PacketConn
 	var ipv6Ifaces []net.Interface
 	if (opts.listenOn & IPv6) > 0 {
-		var err error
-		ipv6conn, ipv6Ifaces, err = joinUdp6Multicast(ifaces)
-		if err != nil {
-			return nil, err
+		ipv6conn, ipv6Ifaces, ipv6Err = joinUdp6Multicast(ifaces)
+		if opts.listenOn == IPv6 && ipv6Err != nil {
+			return nil, ipv6Err
 		}
+	}
+
+	if opts.listenOn == IPv4AndIPv6 && ipv4conn == nil && ipv6conn == nil {
+		return nil, fmt.Errorf("Failed to listen on a socket. Error: %w", multierr.Combine(ipv4Err, ipv6Err))
 	}
 
 	inboundBufferSize := 0
