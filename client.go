@@ -229,7 +229,7 @@ func newClient(
 	}
 
 	if opts.listenOn == IPv4AndIPv6 && ipv4conn == nil && ipv6conn == nil {
-		return nil, fmt.Errorf("Failed to listen on a socket. Error: %w", multierr.Combine(ipv4Err, ipv6Err))
+		return nil, fmt.Errorf("failed to listen on a socket; error: %w", multierr.Combine(ipv4Err, ipv6Err))
 	}
 
 	inboundBufferSize := 0
